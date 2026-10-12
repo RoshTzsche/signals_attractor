@@ -1,0 +1,11 @@
+{
+  "channels": ["EEG Fpz-Cz", "EEG Pz-Oz"],
+  "recordings": [
+    {"id":"s01_n1","subject":"s01","split":"train","signal":"../data/s01-PSG.edf","annotations":"../data/s01-Hypnogram.edf","annotation_offset_s":0},
+    {"id":"s02_n1","subject":"s02","split":"train","signal":"../data/s02-PSG.edf","annotations":"../data/s02-Hypnogram.edf","annotation_offset_s":0},
+    {"id":"s03_n1","subject":"s03","split":"validation","signal":"../data/s03-PSG.edf","annotations":"../data/s03-Hypnogram.edf","annotation_offset_s":0},
+    {"id":"s04_n1","subject":"s04","split":"validation","signal":"../data/s04-PSG.edf","annotations":"../data/s04-Hypnogram.edf","annotation_offset_s":0},
+    {"id":"s05_n1","subject":"s05","split":"test","signal":"../data/s05-PSG.edf","annotations":"../data/s05-Hypnogram.edf","annotation_offset_s":0},
+    {"id":"s06_n1","subject":"s06","split":"test","signal":"../data/s06-PSG.edf","annotations":"../data/s06-Hypnogram.edf","annotation_offset_s":0}
+  ]
+}
