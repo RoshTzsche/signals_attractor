@@ -1,1228 +1,267 @@
-"""
-╔══════════════════════════════════════════════════════════════════╗
-║   BIOMEDICAL SIGNAL PROCESSING & TOPOLOGICAL ANALYSIS ENGINE    ║
-║   Takens' Attractor Dashboard  ·  v2.0                          ║
-╚══════════════════════════════════════════════════════════════════╝
-
-SUPPORTED FILE FORMATS:
-  · EDF / BDF  — European Data Format (clinical EEG standard)
-  · CSV / TXT  — Tabular signal data (auto-detect time/channel columns)
-  · FIF        — MNE/Neuromag format
-  · SET        — EEGLAB format
-  · NPY        — NumPy array (1D or 2D, first column used)
-
-INSTALL:
-  pip install dash dash-bootstrap-components plotly numpy scipy
-              pywt mne pandas dash-uploader
-
-RUN:
-  python takens_attractor_dashboard.py
-  Then open → http://127.0.0.1:8050
-"""
-
-import io
+"""Local multichannel explorer. Training: python -m awakening --help."""
 import base64
-import warnings
-import traceback
+from collections import OrderedDict
+import io
+import json
+from pathlib import Path
 import tempfile
-import os
-import pathlib
-
-import numpy as np
-import pandas as pd
-import scipy.signal as sp_signal
-from numpy.lib.stride_tricks import as_strided
-
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.express as px
+import threading
+import uuid
 
 import dash
-from dash import dcc, html, Input, Output, State, callback_context, no_update
+from dash import Input, Output, State, dcc, html, no_update
 import dash_bootstrap_components as dbc
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from scipy import signal
 
-warnings.filterwarnings("ignore")
+from awakening.config import Config
+from awakening.io import load_recording
+from awakening.features import delay_embedding, filter_causal, geometry
+from awakening.diagnostics import ami_delay, correlation_curve, fnn_curve
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS & EEG BAND DEFINITIONS
-# ─────────────────────────────────────────────────────────────────────────────
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG])
+app.title = "EEG · State space & awakening forecasts"
+CACHE = OrderedDict()
+CACHE_LOCK = threading.Lock()
 
-EEG_BANDS = {
-    "δ Delta":   (0.5,  4.0,  "#4361ee"),
-    "θ Theta":   (4.0,  8.0,  "#7209b7"),
-    "α Alpha":   (8.0,  13.0, "#f72585"),
-    "β Beta":    (13.0, 30.0, "#fb8500"),
-    "γ Gamma":   (30.0, 45.0, "#06d6a0"),
-}
 
-COLORSCALE = "Turbo"
-DARK_BG    = "#0a0c10"
-CARD_BG    = "#0f1318"
-ACCENT     = "#00d4ff"
-BORDER     = "#1e2530"
-
-ACCEPTED_EXTENSIONS = {".edf", ".bdf", ".fif", ".set", ".csv", ".txt", ".tsv", ".npy"}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. MULTI-FORMAT FILE INGESTION
-# ─────────────────────────────────────────────────────────────────────────────
-
-def ingest_file(content_bytes: bytes, filename: str):
-    """
-    Universal file ingestion.  Returns:
-        channels   : dict[name → np.ndarray]
-        fs         : float  (sampling frequency)
-        format_tag : str
-    """
-    ext = pathlib.Path(filename).suffix.lower()
-
-    # ── EDF / BDF ──────────────────────────────────────────────────────────
-    if ext in (".edf", ".bdf"):
-        try:
+def ingest_file(content_bytes, filename, fs=None, unit=None, time_column=None):
+    """Read into volts. Text/NPY need explicit metadata; EDF-family uses its header."""
+    suffix = Path(filename).suffix.lower()
+    if len(content_bytes) > 64*1024*1024:
+        raise ValueError("Use the CLI for files larger than 64 MiB")
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / ("signal" + suffix)
+        path.write_bytes(content_bytes)
+        if suffix in {".edf", ".bdf", ".fif", ".set"}:
             import mne
-            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                tmp.write(content_bytes)
-                tmp_path = tmp.name
-            raw = mne.io.read_raw_edf(tmp_path, preload=True, verbose=False)
-            fs = raw.info["sfreq"]
-            channels = {ch: raw.get_data(picks=[ch])[0] * 1e6 for ch in raw.ch_names[:32]}            
-            os.unlink(tmp_path)
-            return channels, fs, ext.upper()
-        except ImportError:
-            raise RuntimeError("MNE-Python is required for EDF/BDF files.  pip install mne")
-
-    # ── FIF ────────────────────────────────────────────────────────────────
-    elif ext == ".fif":
-        try:
-            import mne
-            with tempfile.NamedTemporaryFile(suffix=".fif", delete=False) as tmp:
-                tmp.write(content_bytes)
-                tmp_path = tmp.name
-            raw = mne.io.read_raw_fif(tmp_path, preload=True, verbose=False)
-            fs = raw.info["sfreq"]
-            channels = {ch: raw.get_data(picks=[ch])[0] for ch in raw.ch_names[:32]}
-            os.unlink(tmp_path)
-            return channels, fs, "FIF"
-        except ImportError:
-            raise RuntimeError("MNE-Python is required for FIF files.  pip install mne")
-
-    # ── SET (EEGLAB) ────────────────────────────────────────────────────────
-    elif ext == ".set":
-        try:
-            import mne
-            with tempfile.NamedTemporaryFile(suffix=".set", delete=False) as tmp:
-                tmp.write(content_bytes)
-                tmp_path = tmp.name
-            raw = mne.io.read_raw_eeglab(tmp_path, preload=True, verbose=False)
-            fs = raw.info["sfreq"]
-            channels = {ch: raw.get_data(picks=[ch])[0] for ch in raw.ch_names[:32]}
-            os.unlink(tmp_path)
-            return channels, fs, "EEGLAB/.SET"
-        except ImportError:
-            raise RuntimeError("MNE-Python is required for SET files.  pip install mne")
-
-    # ── CSV / TSV / TXT ────────────────────────────────────────────────────
-    elif ext in (".csv", ".txt", ".tsv"):
-        sep = "\t" if ext == ".tsv" else None
-        df = pd.read_csv(io.BytesIO(content_bytes), sep=sep, engine="python",
-                         on_bad_lines="skip")
-        df = df.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
-
-        # Heuristic: drop obvious time columns (monotone-increasing)
-        time_col = None
-        for col in df.columns:
-            diffs = np.diff(df[col].dropna().values)
-            if np.all(diffs > 0) and diffs.std() < diffs.mean() * 0.05:
-                time_col = col
-                break
-
-        sig_cols = [c for c in df.columns if c != time_col]
-        if not sig_cols:
-            raise ValueError("No numeric signal columns detected in CSV.")
-
-        # Estimate fs from time column or assume 256 Hz
-        if time_col is not None:
-            dt = np.median(np.diff(df[time_col].dropna().values))
-            fs = float(1.0 / dt) if dt > 0 else 256.0
+            readers = {".edf": mne.io.read_raw_edf, ".bdf": mne.io.read_raw_bdf,
+                       ".fif": mne.io.read_raw_fif, ".set": mne.io.read_raw_eeglab}
+            raw = readers[suffix](str(path), preload=False, verbose="ERROR")
+            channels = [n for n, t in zip(raw.ch_names, raw.get_channel_types()) if t in {"eeg", "eog", "emg"}]
+            raw.close()
+        elif suffix == ".npz":
+            with np.load(path, allow_pickle=False) as z:
+                channels = z["channels"].astype(str).tolist()
+        elif suffix == ".npy":
+            a = np.load(path, allow_pickle=False)
+            if a.ndim not in (1, 2):
+                raise ValueError("NPY must have samples x channels")
+            channels = [f"CH_{i}" for i in range(1 if a.ndim == 1 else a.shape[1])]
+        elif suffix in {".csv", ".tsv", ".txt"}:
+            df = pd.read_csv(path, sep="\t" if suffix == ".tsv" else None, engine="python")
+            channels = [str(c) for c in df.columns if c != time_column]
         else:
-            fs = 256.0
-
-        channels = {str(c): df[c].dropna().values.astype(np.float64)
-                    for c in sig_cols[:32]}
-        return channels, fs, "CSV"
-
-    # ── NPY ────────────────────────────────────────────────────────────────
-    elif ext == ".npy":
-        arr = np.load(io.BytesIO(content_bytes), allow_pickle=False)
-        if arr.ndim == 1:
-            channels = {"CH_0": arr.astype(np.float64)}
-        elif arr.ndim == 2:
-            # rows = samples, cols = channels  (or transpose if needed)
-            if arr.shape[0] < arr.shape[1]:
-                arr = arr.T
-            channels = {f"CH_{i}": arr[:, i].astype(np.float64)
-                        for i in range(min(32, arr.shape[1]))}
-        else:
-            raise ValueError("NPY array must be 1D or 2D.")
-        return channels, 256.0, "NumPy/.NPY"
-
-    else:
-        raise ValueError(
-            f"Unsupported format: '{ext}'.  "
-            f"Accepted: {', '.join(sorted(ACCEPTED_EXTENSIONS))}"
-        )
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. SIGNAL ANALYSIS UTILITIES
-# ─────────────────────────────────────────────────────────────────────────────
-
-def bandpass(x: np.ndarray, fs: float, lo: float, hi: float) -> np.ndarray:
-    """Zero-phase IIR filtering using mathematically stable Second-Order Sections (SOS)."""
-    nyq = fs / 2.0
-    lo_n, hi_n = max(lo / nyq, 1e-4), min(hi / nyq, 0.999)
-    if lo_n >= hi_n:
-        return np.zeros_like(x)
-        
-    # SOS cascade design prevents pole-zero cancellation instability
-    sos = sp_signal.butter(4, [lo_n, hi_n], btype="band", output='sos')
-    return sp_signal.sosfiltfilt(sos, x)
-
-def compute_band_powers(x: np.ndarray, fs: float) -> dict:
-    """Welch PSD → relative band powers (%). Normalized to canonical EEG bands."""
-    nperseg = min(len(x), int(fs * 4))
-    freqs, psd = sp_signal.welch(x, fs=fs, nperseg=nperseg)
-    
-    # Calculate absolute power per band
-    powers_abs = {}
-    for name, (lo, hi, _) in EEG_BANDS.items():
-        mask = (freqs >= lo) & (freqs <= hi)
-        powers_abs[name] = float(np.trapz(psd[mask], freqs[mask]))
-        
-    # Normalize strictly against the sum of the 5 canonical bands, avoiding empty Nyquist space
-    total_canonical = sum(powers_abs.values()) + 1e-12
-    powers = {k: (v / total_canonical) * 100 for k, v in powers_abs.items()}
-    return powers, freqs, psd
-
-def compute_optimal_tau(x: np.ndarray, fs: float, max_lag_sec: float = 1.0, bins: int = 32) -> int:
-    """AMI optimal delay. Optimized with stationary subsampling."""
-    # PERFORMANCE CAP: Use representative sample for probability distribution
-    if len(x) > 1000: x = x[:1000] 
-    
-    max_lag = int(max_lag_sec * fs)
-    if len(x) <= max_lag: return max(1, int(fs * 0.05))
-    
-    ami = np.zeros(max_lag)
-    for tau in range(1, max_lag + 1):
-        x_t = x[:-tau]
-        x_tau = x[tau:]
-        hist_2d, _, _ = np.histogram2d(x_t, x_tau, bins=bins)
-        p_xy = hist_2d / np.sum(hist_2d)
-        p_x = np.sum(p_xy, axis=1)
-        p_y = np.sum(p_xy, axis=0)
-        p_x_p_y = np.outer(p_x, p_y)
-        nz = p_xy > 0
-        ami[tau-1] = np.sum(p_xy[nz] * np.log2(p_xy[nz] / p_x_p_y[nz]))
-        if tau > 2 and ami[tau-2] < ami[tau-3] and ami[tau-2] < ami[tau-1]:
-            return tau - 1
-    return int(np.argmin(ami) + 1)
-
-def compute_optimal_dimension(x: np.ndarray, tau: int, max_m: int = 5) -> int:
-    """FNN heuristic. Optimized with stationary subsampling."""
-    from scipy.spatial import cKDTree
-    # PERFORMANCE CAP
-    if len(x) > 1000: x = x[:1000]
-    
-    N = len(x)
-    if N < 100: return 3
-    
-    R_tol, A_tol = 15.0, 2.0
-    R_A = np.std(x) + 1e-12
-    fnn_ratios = []
-    
-    for m in range(2, max_m + 1):
-        try:
-            E = phase_space(x, tau, dim=m)
-            tree = cKDTree(E)
-            distances, indices = tree.query(E, k=2)
-            valid_idx = np.where(distances[:, 1] > 1e-12)[0]
-            if len(valid_idx) == 0:
-                fnn_ratios.append(0)
-                continue
-            false_count = 0
-            for i in valid_idx:
-                nn_i = indices[i, 1]
-                idx1, idx2 = i + m * tau, nn_i + m * tau
-                if idx1 < N and idx2 < N:
-                    d_m1, R_m = abs(x[idx1] - x[idx2]), distances[i, 1]
-                    if (d_m1 / R_m) > R_tol or np.sqrt(R_m**2 + d_m1**2) / R_A > A_tol:
-                        false_count += 1
-            fnn_ratios.append(false_count / len(valid_idx))
-        except Exception:
-            fnn_ratios.append(1.0)
-    
-    for i, m in enumerate(range(2, max_m + 1)):
-        if fnn_ratios[i] < 0.05: return max(3, min(m, 5))
-    return 3
-
-def phase_space(x: np.ndarray, tau: int, dim: int = 3) -> np.ndarray:
-    N = len(x)
-    M = N - (dim - 1) * tau
-    if M <= 0:
-        raise ValueError("Signal too short for chosen tau/dimension.")
-    sz = x.itemsize
-    return as_strided(x, shape=(M, dim), strides=(sz, sz * tau))
+            raise ValueError("Supported: EDF/BDF/FIF/SET, CSV/TSV/TXT, NPY/NPZ")
+        return load_recording(path, channels, fs, unit, time_column)
 
 
-def signal_quality(x: np.ndarray, fs: float) -> dict:
-    """Compute basic signal quality metrics."""
-    rms   = float(np.sqrt(np.mean(x ** 2)))
-    snr   = float(10 * np.log10(np.var(x) / (np.var(np.diff(x)) + 1e-12)))
-    kurt  = float(pd.Series(x).kurtosis())
-    hurst = _hurst_exponent(x)
-    # Artifact score: z-score spikes
-    z     = np.abs((x - np.mean(x)) / (np.std(x) + 1e-12))
-    artifact_pct = float(np.mean(z > 4) * 100)
-    return {
-        "RMS Amplitude (μV)": f"{rms:.3f}",
-        "Signal SNR (dB)":    f"{snr:.1f}",
-        "Kurtosis":           f"{kurt:.2f}",
-        "Hurst Exponent":     f"{hurst:.3f}",
-        "Artifact %":         f"{artifact_pct:.2f}%",
-    }
+def store_recording(recording):
+    token = uuid.uuid4().hex
+    with CACHE_LOCK:
+        CACHE[token] = recording
+        while len(CACHE) > 3:
+            CACHE.popitem(last=False)
+    return token
 
 
-def _hurst_exponent(x: np.ndarray) -> float:
-    """Detrended Fluctuation Analysis (DFA) for robust Hurst estimation."""
-    N = len(x)
-    if N < 100: return 0.5
-    
-    # 1. Integrate the mean-centered signal
-    y = np.cumsum(x - np.mean(x))
-    
-    # 2. Define logarithmic window scales
-    scales = np.logspace(1.2, np.log10(N/4), 15).astype(int)
-    scales = np.unique(scales)
-    
-    F = []
-    for n in scales:
-        # Reshape into non-overlapping windows
-        n_windows = N // n
-        windows = y[:n_windows * n].reshape(n_windows, n)
-        
-        # 3. Fit local linear trend (DFA-1) and compute RMS fluctuation
-        x_axis = np.arange(n)
-        coefs = np.polyfit(x_axis, windows.T, 1)
-        trends = np.array([np.polyval(c, x_axis) for c in coefs.T])
-        
-        rms = np.sqrt(np.mean((windows - trends)**2))
-        F.append(rms)
-        
-    # 4. Extract scaling exponent alpha
-    poly = np.polyfit(np.log(scales), np.log(F), 1)
-    
-    # Alpha can theoretically reach ~1.5 for highly non-stationary signals
-    return float(np.clip(poly[0], 0.0, 1.5))
-
-def spectral_energy_gradient(x: np.ndarray, fs: float, n_points: int) -> np.ndarray:
-    """Fast short-time spectral energy via STFT (replaces heavy CWT for speed)."""
-    try:
-        import pywt
-        freqs_cwt = np.linspace(1, min(45, fs / 2 - 1), 30)
-        scales    = pywt.frequency2scale("morl", freqs_cwt / fs)
-        cwt_mat, _= pywt.cwt(x, scales, "morl", sampling_period=1 / fs)
-        energy    = np.sum(np.abs(cwt_mat) ** 2, axis=0)
-    except Exception:
-        # Fallback: STFT-based energy
-        nperseg = min(256, len(x) // 4)
-        _, _, Zxx = sp_signal.stft(x, fs=fs, nperseg=nperseg,
-                                   noverlap=nperseg - 1, boundary=None)
-        energy = np.sum(np.abs(Zxx) ** 2, axis=0)
-        if len(energy) > len(x):
-            energy = energy[:len(x)]
-        elif len(energy) < len(x):
-            energy = np.interp(np.linspace(0, 1, len(x)),
-                               np.linspace(0, 1, len(energy)), energy)
-    mn, mx = energy.min(), energy.max()
-    energy = (energy - mn) / (mx - mn + 1e-12)
-    return energy[:n_points]
-
-def correlation_dimension(E: np.ndarray, r_min: float = 1e-3, r_max: float = 1.0, n_r: int = 20) -> float:
-    """Grassberger-Procaccia D2. Optimized with randomized subsampling."""
-    from scipy.spatial import cKDTree
-    
-    # PERFORMANCE CAP: Random spatial sample reduces O(N^2) load
-    if len(E) > 1000:
-        np.random.seed(42)
-        idx = np.random.choice(len(E), 1000, replace=False)
-        E = E[idx]
-        
-    N = len(E)
-    if N < 100: return 0.0
-    E_norm = (E - np.min(E, axis=0)) / (np.max(E, axis=0) - np.min(E, axis=0) + 1e-12)
-    tree = cKDTree(E_norm)
-    scales = np.logspace(np.log10(r_min), np.log10(r_max), n_r)
-    C_r = np.zeros(n_r)
-    for i, r in enumerate(scales):
-        pairs = tree.query_pairs(r)
-        C_r[i] = len(pairs) / (N * (N - 1) / 2.0)
-    valid = C_r > 0
-    if np.sum(valid) < 3: return 0.0
-    poly = np.polyfit(np.log(scales[valid]), np.log(C_r[valid]), 1)
-    return float(poly[0])
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. FIGURE BUILDERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-TRANSPARENT = "rgba(0,0,0,0)"
-
-def _layout_base(title=""):
-    return dict(
-        template="plotly_dark",
-        paper_bgcolor=TRANSPARENT,
-        plot_bgcolor=TRANSPARENT,
-        title_text=title,
-        title_font=dict(size=13, color="#a0aec0", family="'JetBrains Mono', monospace"),
-        margin=dict(l=40, r=20, t=40, b=40),
-        font=dict(family="'JetBrains Mono', monospace", color="#a0aec0"),
-    )
+def get_recording(token):
+    with CACHE_LOCK:
+        if token not in CACHE:
+            raise ValueError("Load the signal again; it is no longer in the local cache")
+        return CACHE[token]
 
 
-def fig_timeseries(t, x, energy, channel, tau):
-    M = len(energy)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=t[:M], y=x[:M],
-        mode="lines",
-        line=dict(color="rgba(0,212,255,0.25)", width=1),
-        showlegend=False,
-    ))
-    fig.add_trace(go.Scatter(
-        x=t[:M], y=x[:M],
-        mode="markers",
-        marker=dict(size=2.5, color=energy, colorscale=COLORSCALE,
-                    showscale=True,
-                    colorbar=dict(title="Energy", thickness=10, x=1.02,
-                                  tickfont=dict(size=9))),
-        name="EEG",
-        hovertemplate="t=%{x:.3f}s<br>μV=%{y:.2f}<extra></extra>",
-    ))
-    fig.update_layout(**_layout_base(f"Time Domain  ·  {channel}  ·  τ={tau} smp"),
-                      height=280,
-                      xaxis=dict(title="Time (s)", gridcolor=BORDER, zeroline=False),
-                      yaxis=dict(title="μV", gridcolor=BORDER, zeroline=False))
-    return fig
+def style_figure(figure, title):
+    return figure.update_layout(template="plotly_dark", title=title,
+                                margin=dict(l=45, r=20, t=50, b=40), height=380)
 
 
-def fig_phase_space(E, energy, tau):
-    fig = go.Figure(go.Scatter3d(
-        x=E[:, 0], y=E[:, 1], z=E[:, 2],
-        mode="lines",
-        line=dict(width=2.5, color=energy, colorscale=COLORSCALE,
-                  cmin=0, cmax=1,
-                  colorbar=dict(title="Energy", thickness=10,
-                                tickfont=dict(size=9))),
-        hovertemplate="x(t)=%{x:.2f}<br>x(t+τ)=%{y:.2f}<br>x(t+2τ)=%{z:.2f}<extra></extra>",
-    ))
-    fig.update_layout(
-        **_layout_base(f"Takens' Attractor  ·  dim=3  ·  τ={tau}"),
-        height=480,
-        scene=dict(
-            xaxis=dict(title="x(t)",     backgroundcolor=DARK_BG,
-                       gridcolor=BORDER, zerolinecolor=BORDER),
-            yaxis=dict(title="x(t+τ)",   backgroundcolor=DARK_BG,
-                       gridcolor=BORDER, zerolinecolor=BORDER),
-            zaxis=dict(title="x(t+2τ)",  backgroundcolor=DARK_BG,
-                       gridcolor=BORDER, zerolinecolor=BORDER),
-            bgcolor=DARK_BG,
-        ),
-        scene_camera=dict(eye=dict(x=1.6, y=1.6, z=0.9)),
-    )
-    return fig
+def number(label, identity, value, minimum, step=1):
+    return dbc.Col([dbc.Label(label), dbc.Input(id=identity, type="number", value=value,
+                                               min=minimum, step=step)], md=2)
 
 
-def fig_psd(freqs, psd):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=freqs, y=10 * np.log10(psd + 1e-30),
-                             mode="lines", line=dict(color=ACCENT, width=1.5),
-                             fill="tozeroy",
-                             fillcolor="rgba(0,212,255,0.06)",
-                             name="PSD",
-                             hovertemplate="%{x:.1f} Hz : %{y:.1f} dB<extra></extra>"))
-    # Band overlays
-    for name, (lo, hi, col) in EEG_BANDS.items():
-        fig.add_vrect(x0=lo, x1=hi,
-                      fillcolor=col, opacity=0.08,
-                      line_width=0, annotation_text=name.split()[0],
-                      annotation_position="top",
-                      annotation_font=dict(size=8, color=col))
-    fig.update_layout(**_layout_base("Power Spectral Density"),
-                      height=240,
-                      xaxis=dict(title="Frequency (Hz)", gridcolor=BORDER,
-                                 range=[0, 50]),
-                      yaxis=dict(title="dB/Hz", gridcolor=BORDER))
-    return fig
-
-
-def fig_band_radar(powers: dict):
-    names  = list(powers.keys())
-    values = list(powers.values())
-    colors = [EEG_BANDS[n][2] for n in names]
-    fig = go.Figure(go.Barpolar(
-        r=values, theta=names,
-        marker=dict(color=colors, line_color=DARK_BG, line_width=1),
-        opacity=0.85,
-        hovertemplate="%{theta}: %{r:.1f}%<extra></extra>",
-    ))
-    fig.update_layout(
-        **_layout_base("Band Power Distribution"),
-        height=260,
-        polar=dict(
-            bgcolor=TRANSPARENT,
-            radialaxis=dict(visible=True, gridcolor=BORDER,
-                            tickfont=dict(size=8),
-                            ticksuffix="%"),
-            angularaxis=dict(gridcolor=BORDER),
-        ),
-        showlegend=False,
-    )
-    return fig
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. DASH APPLICATION
-# ─────────────────────────────────────────────────────────────────────────────
-
-GOOGLE_FONTS = (
-    "https://fonts.googleapis.com/css2?"
-    "family=JetBrains+Mono:wght@300;400;600&"
-    "family=Space+Grotesk:wght@300;400;700&display=swap"
-)
-
-app = dash.Dash(
-    __name__,
-    external_stylesheets=[dbc.themes.CYBORG, GOOGLE_FONTS],
-    suppress_callback_exceptions=True,
-)
-app.title = "Takens Attractor · EEG Dashboard"
-
-# ── CSS overrides ─────────────────────────────────────────────────────────────
-# ── CSS overrides ─────────────────────────────────────────────────────────────
-EXTRA_CSS = f"""
-:root {{
-  --bg:      {DARK_BG};
-  --card:    {CARD_BG};
-  --accent:  {ACCENT};
-  --border:  {BORDER};
-  --text:    #c8d6e5;
-  --muted:   #566573;
-  --mono:    'JetBrains Mono', monospace;
-  --sans:    'Space Grotesk', sans-serif;
-}}
-body, .container-fluid {{ background: var(--bg) !important; color: var(--text); }}
-.card {{ background: var(--card) !important; border: 1px solid var(--border) !important; border-radius: 10px !important; }}
-.card-header {{ background: rgba(255,255,255,0.03) !important; border-bottom: 1px solid var(--border) !important; font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; color: var(--accent) !important; text-transform: uppercase; }}
-
-/* Metrics & Dropzones */
-.metric-card {{ background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px 18px; }}
-.metric-label {{ font-family: var(--mono); font-size: 10px; color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 4px; }}
-.metric-value {{ font-family: var(--mono); font-size: 18px; color: var(--accent); font-weight: 600; }}
-.insight-row {{ display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 11px; }}
-.insight-label {{ color: var(--muted); }}
-.insight-value {{ color: var(--text); font-weight: 600; }}
-.drop-zone {{ border: 2px dashed var(--border); border-radius: 12px; background: rgba(0,212,255,0.02); padding: 40px; text-align: center; cursor: pointer; transition: all 0.2s ease; font-family: var(--mono); }}
-.drop-zone:hover, .drop-zone.dragover {{ border-color: var(--accent); background: rgba(0,212,255,0.06); }}
-.drop-icon {{ font-size: 40px; margin-bottom: 12px; opacity: 0.5; }}
-.drop-title {{ color: var(--text); font-size: 14px; margin-bottom: 6px; }}
-.drop-sub {{ color: var(--muted); font-size: 11px; }}
-.badge-fmt {{ background: var(--accent); color: var(--bg); padding: 2px 8px; border-radius: 4px; font-family: var(--mono); font-size: 10px; font-weight: 600; }}
-
-/* 1. DASH DROPDOWN OVERRIDES (CHANNEL SELECT) */
-.Select-control {{background-color: var(--bg) !important; border-color: var(--border) !important; }}
-.Select-menu-outer {{background-color: var(--bg) !important; border: 1px solid var(--border) !important; }}
-.Select-option {{background-color: var(--bg) !important; color: var(--text) !important;}}
-.Select-option:hover, .Select-option.is-focused {{background-color: var(--border) !important; color: var(--accent) !important; }}
-/* Force blue letters for the selected channel */
-.has-value.Select--single > .Select-control .Select-value .Select-value-label, 
-.has-value.is-pseudo-focused.Select--single > .Select-control .Select-value .Select-value-label {{color: var(--accent) !important; font-weight: 600; }}
-.Select-input > input {{ color: var(--accent) !important; }}
-.Select-placeholder {{color: var(--muted) !important; }}
-/* 2. DASH SLIDER OVERRIDES (PARAMETERS & EPOCH) */
-.rc-slider-track {{ background-color: var(--accent) !important; }}
-.rc-slider-handle {{ border-color: var(--accent) !important; background: var(--accent) !important; box-shadow: none !important; }}
-.rc-slider-mark-text {{ color: var(--muted) !important; font-family: var(--mono); }}
-.rc-slider-mark-text-active {{ color: var(--text) !important; }}
-.rc-slider-tooltip-inner {{ background-color: var(--card) !important; color: var(--accent) !important; border: 1px solid var(--border) !important; box-shadow: none !important; font-family: var(--mono); }}
-.rc-slider-tooltip-arrow {{ border-top-color: var(--border) !important; border-bottom-color: var(--border) !important; }}
-
-/* Add this inside the EXTRA_CSS string, at the bottom */
-.num-input {{ 
-    background: var(--bg); border: 1px solid var(--border); 
-    color: var(--accent); font-family: var(--mono); 
-    font-size: 11px; width: 100%; border-radius: 4px; 
-    padding: 2px 6px; text-align: center; outline: none; 
-    transition: border-color 0.2s;
-}}
-.num-input:focus {{ border-color: var(--accent); }}
-
-/* Buttons & Status */
-.btn-run {{ background: linear-gradient(135deg, var(--accent), #0080ff); border: none; color: var(--bg); font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: 0.05em; padding: 10px 28px; border-radius: 6px; cursor: pointer; transition: opacity 0.2s; width: 100%; margin-top: 12px; }}
-.btn-run:hover {{ opacity: 0.85; }}
-#status-bar {{ font-family: var(--mono); font-size: 11px; padding: 8px 14px; border-radius: 6px; margin-top: 10px; }}
-"""
-pathlib.Path("assets").mkdir(exist_ok=True)
-with open("assets/custom.css", "w") as _f:
-    _f.write(EXTRA_CSS)
-# ── Layout ─────────────────────────────────────────────────────────────────────
-
-def make_metric_card(label, value_id, default="—"):
-    return html.Div([
-        html.Div(label, className="metric-label"),
-        html.Div(default, id=value_id, className="metric-value"),
-    ], className="metric-card")
-
-
-sidebar = html.Div([
-    # Header
-    html.Div([
-        html.Div("⬡", style={"fontSize": "24px", "color": ACCENT, "marginBottom": "4px"}),
-        html.Div("3D signal Analysis", style={
-            "fontFamily": "'JetBrains Mono', monospace",
-            "fontSize": "13px", "fontWeight": "600",
-            "color": ACCENT, "letterSpacing": "0.12em",
-        }),
-        html.Div("Topological EEG Analysis _ Rosh Guadiana & Lourdes García _ Git: RoshTzsche", style={
-            "fontFamily": "'JetBrains Mono', monospace",
-            "fontSize": "10px", "color": "#566573", "marginTop": "2px",
-        }),
-    ], style={"textAlign": "center", "padding": "20px 10px 16px"}),
-
-    html.Hr(style={"borderColor": BORDER, "margin": "0 0 16px"}),
-
-    # Upload
-    dbc.Card([
-        dbc.CardHeader("01 · Upload Signal File"),
-        dbc.CardBody([
-            dcc.Upload(
-                id="upload-data",
-                children=html.Div([
-                    html.Div("⬆", className="drop-icon"),
-                    html.Div("Drop file here or click to browse", className="drop-title"),
-                    html.Div("EDF · BDF · CSV · FIF · SET · NPY · TXT", className="drop-sub"),
-                ]),
-                className="drop-zone",
-                multiple=False,
-                style={"outline": "none"},
-            ),
-            html.Div(id="file-info", style={"marginTop": "10px"}),
-        ])
-    ], style={"marginBottom": "12px"}),
-
-    # Channel selector
-    dbc.Card([
-        dbc.CardHeader("02 · Select Channel"),
-        dbc.CardBody([
-            dcc.Dropdown(id="channel-select",
-                         placeholder="— load a file first —",
-                         clearable=False,
-                         style={"fontFamily": "'JetBrains Mono',monospace",
-                                "fontSize": "12px"}),
-        ])
-    ], style={"marginBottom": "12px"}),
-
-# Epoch
-    dbc.Card([
-        dbc.CardHeader("03 · Epoch Window (seconds)"),
-        dbc.CardBody([
-            dbc.Row([
-                dbc.Col(html.Div("Start", style={
-                    "fontFamily": "'JetBrains Mono',monospace", "fontSize": "10px", 
-                    "color": "#566573", "textTransform": "uppercase"
-                }), width=3),
-                dbc.Col(dcc.Input(id="epoch-start-input", type="number", min=0, max=60, step=0.5, value=0, className="num-input"), width=3),
-                dbc.Col(html.Div("End", style={
-                    "fontFamily": "'JetBrains Mono',monospace", "fontSize": "10px", 
-                    "color": "#566573", "textTransform": "uppercase", "textAlign": "right"
-                }), width=3),
-                dbc.Col(dcc.Input(id="epoch-end-input", type="number", min=0, max=60, step=0.5, value=15, className="num-input"), width=3)
-            ], align="center", style={"marginBottom": "12px"}),
-            
-            dcc.RangeSlider(id="epoch-slider", min=0, max=60, step=0.5,
-                            value=[0, 15], allowCross=False,
-                            tooltip={"placement": "bottom", "always_visible": False},
-                            marks={i: {"label": str(i),
-                                       "style": {"fontSize": "10px", "color": "#566573"}}
-                                   for i in range(0, 61, 10)}),
-        ])
-    ], style={"marginBottom": "12px"}),
-# Parameters
-    dbc.Card([
-        dbc.CardHeader([
-            html.Div("04 · Parameters", style={"display": "inline-block"}),
-            html.Button("AUTO", id="btn-auto", n_clicks=0, style={
-                "float": "right", "background": "var(--accent)", "color": "var(--bg)",
-                "border": "none", "borderRadius": "4px", "fontSize": "9px",
-                "fontWeight": "bold", "padding": "2px 6px", "cursor": "pointer",
-                "fontFamily": "var(--mono)", "letterSpacing": "0.1em",
-                "transition": "all 0.3s ease"
-            })
-        ]),
-        dcc.Loading(
-            id="loading-auto",
-            type="circle", 
-            color=ACCENT,
-            children=dbc.CardBody([
-                
-                # Embedding Dimension Row
-                dbc.Row([
-                    dbc.Col(html.Div("Embedding Dim (m)", style={
-                        "fontFamily": "'JetBrains Mono',monospace", "fontSize": "10px", 
-                        "color": "#566573", "textTransform": "uppercase"
-                    }), width=8),
-                    dbc.Col(dcc.Input(id="dim-input", type="number", min=3, max=5, step=1, value=3, className="num-input"), width=4)
-                ], align="center", style={"marginBottom": "6px"}),
-                
-                dcc.Slider(id="dim-slider", min=3, max=5, step=1, value=3,
-                           marks={3: "3", 4: "4", 5: "5 (slow)"},
-                           tooltip={"always_visible": False}),
-                
-                # Tau Search Row
-                dbc.Row([
-                    dbc.Col(html.Div("Max Tau Search (ms)", style={
-                        "fontFamily": "'JetBrains Mono',monospace", "fontSize": "10px", 
-                        "color": "#566573", "textTransform": "uppercase"
-                    }), width=8),
-                    dbc.Col(dcc.Input(id="tau-input", type="number", min=10, max=1000, step=10, value=150, className="num-input"), width=4)
-                ], align="center", style={"marginTop": "14px", "marginBottom": "6px"}),
-                
-                dcc.Slider(id="tau-slider", min=10, max=500, step=10, value=150,
-                           tooltip={"placement": "bottom", "always_visible": False}),
-                
-                html.Div(id="auto-status", style={
-                    "fontFamily": "'JetBrains Mono',monospace", 
-                    "fontSize": "10px", "color": "var(--accent)", 
-                    "marginTop": "12px", "textAlign": "center",
-                    "minHeight": "14px"
-                })
-            ])
-        )
-    ], style={"marginBottom": "12px"}),
-
-    # Run button
-    html.Button("▶  RUN ANALYSIS", id="run-btn", n_clicks=0,
-                className="btn-run"),
-
-    html.Div(id="status-bar", style={"display": "none"}),
-
-], style={
-    "width": "280px", "minWidth": "280px",
-    "background": CARD_BG,
-    "borderRight": f"1px solid {BORDER}",
-    "height": "100vh",
-    "overflowY": "auto",
-    "padding": "0",
-    "display": "flex",
-    "flexDirection": "column",
-})
-
-main_area = html.Div([
-    # Top metrics row
-    dbc.Row([
-        dbc.Col(make_metric_card("Sampling Rate", "m-fs"),    md=2),
-        dbc.Col(make_metric_card("Duration",       "m-dur"),  md=2),
-        dbc.Col(make_metric_card("Optimal τ",      "m-tau"),  md=2),
-        dbc.Col(make_metric_card("Samples",        "m-smp"),  md=2),
-        dbc.Col(make_metric_card("RMS (μV)",        "m-rms"),  md=2),
-        dbc.Col(make_metric_card("SNR (dB)",        "m-snr"),  md=2),
-    ], className="g-2", style={"marginBottom": "16px"}),
-
-    # Main plots
-    dbc.Row([
-        dbc.Col([
-            dbc.Card([
-                dbc.CardHeader("Time Domain Signal"),
-                dbc.CardBody([dcc.Graph(id="fig-ts",
-                                       config={"displayModeBar": True,
-                                               "modeBarButtonsToRemove": ["select2d", "lasso2d"]},
-                                       style={"height": "280px"})],
-                             style={"padding": "0"}),
-            ]),
-        ], md=12, style={"marginBottom": "12px"}),
+app.layout = dbc.Container([
+    dcc.Store(id="recording-token"),
+    html.H2("EEG · Espacio de estados y anticipación de despertares", className="mt-4"),
+    html.P("Exploración multicanal y revisión de experimentos. Las trayectorias no certifican un atractor; "
+           "el proyecto aún requiere validación con sueño real."),
+    dbc.Tabs([
+        dbc.Tab([
+            dcc.Upload(id="signal-upload", children=dbc.Button("Elegir señal", className="my-3"), multiple=False),
+            dbc.Row([number("fs (Hz), CSV/NPY", "fs-input", None, 1),
+                     dbc.Col([dbc.Label("Unidad, CSV/NPY"), dcc.Dropdown(id="unit-input", options=["V", "uV"])], md=2),
+                     dbc.Col([dbc.Label("Columna de tiempo (s), opcional"), dbc.Input(id="time-column")], md=4),
+                     dbc.Col(dbc.Button("Cargar señal", id="load-button", className="mt-4"), md=3)]),
+            html.Div(id="load-status", className="my-3"),
+            dbc.Label("Canales simultáneos (máximo 16 en el visor; CLI sin este límite)"),
+            dcc.Dropdown(id="channels", multi=True),
+            dbc.Row([number("Inicio (s)", "start", 20, 0), number("Fin (s)", "end", 80, 1),
+                     number("Dimensión por canal", "dimension", 4, 2),
+                     number("Retardo fijo (ms)", "tau", 50, 1),
+                     number("Pasaaltas (Hz)", "low", .5, .01, .1),
+                     number("Pasabajas (Hz)", "high", 35, 1)], className="mt-3"),
+            dbc.Row([number("Theiler (s)", "theiler", 1, 0, .1),
+                     dbc.Col(dbc.Button("Estimar τ del primer canal", id="auto-button", className="mt-4"), md=4),
+                     dbc.Col(dbc.Button("Analizar", id="run-button", color="info", className="mt-4"), md=2)]),
+            html.Div(id="auto-status", className="my-2"),
+            html.Div(id="analysis-status", className="my-3"),
+            dcc.Loading(dbc.Row([dbc.Col(dcc.Graph(id="time-figure"), md=6),
+                                dbc.Col(dcc.Graph(id="phase-figure"), md=6)])),
+            dbc.Row([dbc.Col(dcc.Graph(id="psd-figure"), md=6), dbc.Col(dcc.Graph(id="dimension-figure"), md=6)]),
+            html.Pre(id="diagnostics", style={"whiteSpace": "pre-wrap"}),
+        ], label="Explorar señal"),
+        dbc.Tab([
+            html.P("Entrena con python -m awakening train. Carga aquí *_predictions.csv o la salida de predict.", className="mt-3"),
+            dcc.Upload(id="forecast-upload", children=dbc.Button("Cargar probabilidades CSV"), multiple=False),
+            html.Div(id="forecast-status", className="my-3"),
+            dcc.Dropdown(id="forecast-record", placeholder="Registro"),
+            dcc.Store(id="forecast-data"),
+            dcc.Graph(id="forecast-figure"),
+            html.P("La etiqueta 0/1 indica un despertar en el intervalo futuro objetivo, no el estado actual. "
+                   "Los CSV de alertas y report.json guardan umbral, falsas alarmas y anticipación. "
+                   "La CLI predict funciona sin etiquetas."),
+        ], label="Probabilidad de despertar"),
     ]),
+], fluid=True)
 
-    dbc.Row([
-        # Attractor
-        dbc.Col([
-            dbc.Card([
-                dbc.CardHeader("3D State-Space Attractor"),
-                dbc.CardBody([dcc.Graph(id="fig-3d",
-                                       config={"displayModeBar": True},
-                                       style={"height": "480px"})],
-                             style={"padding": "0"}),
-            ]),
-        ], md=7),
 
-        # Right panel
-        dbc.Col([
-            dbc.Card([
-                dbc.CardHeader("Power Spectral Density"),
-                dbc.CardBody([dcc.Graph(id="fig-psd",
-                                       config={"displayModeBar": False},
-                                       style={"height": "240px"})],
-                             style={"padding": "0"}),
-            ], style={"marginBottom": "12px"}),
-
-            dbc.Card([
-                dbc.CardHeader("EEG Band Distribution"),
-                dbc.CardBody([dcc.Graph(id="fig-bands",
-                                       config={"displayModeBar": False},
-                                       style={"height": "260px"})],
-                             style={"padding": "0"}),
-            ]),
-        ], md=5),
-    ], className="g-3", style={"marginBottom": "12px"}),
-
-    # Insights row
-    dbc.Row([
-        dbc.Col([
-            dbc.Card([
-                dbc.CardHeader("Signal Quality Metrics"),
-                dbc.CardBody(id="quality-body", style={"padding": "10px 16px"}),
-            ]),
-        ], md=4),
-        dbc.Col([
-            dbc.Card([
-                dbc.CardHeader("Spectral Insights"),
-                dbc.CardBody(id="spectral-body", style={"padding": "10px 16px"}),
-            ]),
-        ], md=4),
-        dbc.Col([
-            dbc.Card([
-                dbc.CardHeader("Dynamics Interpretation"),
-                dbc.CardBody(id="dynamics-body", style={"padding": "10px 16px"}),
-            ]),
-        ], md=4),
-    ], className="g-3"),
-
-], style={"flex": "1", "overflowY": "auto", "padding": "20px"})
-
-app.layout = html.Div([
-    # Hidden stores
-    dcc.Store(id="store-channels"),   
-    dcc.Store(id="store-fs"),         
-    dcc.Store(id="store-fmt"),        
-    dcc.Store(id="store-optimal", data={"m": None, "tau": None}), # NEW: State Machine Cache
-    # Layout
-    html.Div([sidebar, main_area],
-             style={"display": "flex", "height": "100vh", "overflow": "hidden"}),
-], style={"background": DARK_BG})
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. CALLBACKS
-# ─────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. CALLBACKS
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.callback(
-    Output("store-channels", "data"),
-    Output("store-fs",       "data"),
-    Output("store-fmt",      "data"),
-    Output("channel-select", "options"),
-    Output("channel-select", "value"),
-    Output("epoch-slider",   "max"),
-    Output("epoch-slider",   "value"),
-    Output("epoch-start-input", "max"),
-    Output("epoch-end-input", "max"),
-    Output("epoch-start-input", "value"),
-    Output("epoch-end-input", "value"),
-    Output("file-info",      "children"),
-    Input("upload-data", "contents"),
-    State("upload-data", "filename"),
-    prevent_initial_call=True,
-)
-def on_upload(contents, filename):
-    if contents is None:
-        return no_update
-
-    _, b64 = contents.split(",", 1)
-    raw_bytes = base64.b64decode(b64)
-
+@app.callback(Output("recording-token", "data"), Output("channels", "options"),
+              Output("channels", "value"), Output("end", "value"), Output("load-status", "children"),
+              Input("load-button", "n_clicks"), State("signal-upload", "contents"),
+              State("signal-upload", "filename"), State("fs-input", "value"),
+              State("unit-input", "value"), State("time-column", "value"), prevent_initial_call=True)
+def on_upload(clicks, contents, filename, fs, unit, time_column):
     try:
-        channels, fs, fmt = ingest_file(raw_bytes, filename)
-    except Exception as e:
-        err = html.Div([
-            html.Span("⚠ ", style={"color": "#e74c3c"}),
-            html.Span(str(e), style={"fontFamily": "'JetBrains Mono',monospace",
-                                     "fontSize": "11px", "color": "#e74c3c"}),
-        ])
-        return (no_update,) * 7 + (err,)
+        if not contents:
+            raise ValueError("Selecciona un archivo")
+        recording = ingest_file(base64.b64decode(contents.split(",", 1)[1]), filename, fs, unit, time_column or None)
+        duration = len(recording.data)/recording.fs
+        return (store_recording(recording), recording.channels, recording.channels[:2], min(80, duration),
+                f"{filename}: {len(recording.channels)} canales, {recording.fs:g} Hz, {duration:g} s. Unidades internas: V.")
+    except Exception as error:
+        return no_update, no_update, no_update, no_update, f"Error: {error}"
 
-    # Determine max epoch from shortest channel
-    max_dur = float(min(len(v) for v in channels.values()) / fs)
-    default_end = min(15.0, max_dur)
 
-    # Serialise (JSON-friendly)
-    ch_data = {k: v.tolist() for k, v in channels.items()}
-    ch_options = [{"label": k, "value": k} for k in channels.keys()]
-    first_ch   = ch_options[0]["value"]
+def selected_prefix(token, channels, start, end, low, high):
+    rec = get_recording(token)
+    if not channels or len(channels) > 16:
+        raise ValueError("Selecciona entre 1 y 16 canales")
+    if start is None or end is None or not 0 <= start < end <= len(rec.data)/rec.fs:
+        raise ValueError("Ventana temporal inválida")
+    if end-start < 10:
+        raise ValueError("Usa al menos 10 segundos")
+    cfg = Config(low_hz=float(low), high_hz=float(high))
+    columns = [rec.channels.index(c) for c in channels]
+    filtered = filter_causal(rec.data[:int(end*rec.fs), columns], rec.fs, cfg)
+    return filtered[int(start*rec.fs):], rec.fs
 
-    # File info badge
-    info = html.Div([
-        html.Span(fmt, className="badge-fmt"),
-        html.Span(f"  {filename}", style={
-            "fontFamily": "'JetBrains Mono',monospace",
-            "fontSize": "10px", "color": "#a0aec0", "marginLeft": "8px",
-        }),
-        html.Br(),
-        html.Span(f"{len(channels)} ch · {fs:.0f} Hz · {max_dur:.1f}s", style={
-            "fontFamily": "'JetBrains Mono',monospace",
-            "fontSize": "10px", "color": "#566573",
-        }),
-    ], style={"marginTop": "8px"})
 
-    return ch_data, fs, fmt, ch_options, first_ch, max_dur, [0, default_end], max_dur, max_dur, 0, default_end, info
-
-@app.callback(
-    # Figures
-    Output("fig-ts",    "figure"),
-    Output("fig-3d",    "figure"),
-    Output("fig-psd",   "figure"),
-    Output("fig-bands", "figure"),
-    # Top metrics
-    Output("m-fs",  "children"),
-    Output("m-dur", "children"),
-    Output("m-tau", "children"),
-    Output("m-smp", "children"),
-    Output("m-rms", "children"),
-    Output("m-snr", "children"),
-    # Insight panels
-    Output("quality-body",  "children"),
-    Output("spectral-body", "children"),
-    Output("dynamics-body", "children"),
-    # Status
-    Output("status-bar", "children"),
-    Output("status-bar", "style"),
-    # ── Inputs ──
-    Input("run-btn", "n_clicks"),
-    State("store-channels",  "data"),
-    State("store-fs",        "data"),
-    State("channel-select",  "value"),
-    State("epoch-slider",    "value"),
-    State("dim-slider",      "value"),
-    State("tau-slider",      "value"),
-    prevent_initial_call=True,
-)
-def run_analysis(n_clicks, ch_data, fs, channel, epoch, dim, max_tau_ms):
-    empty_fig = go.Figure().update_layout(**_layout_base(), height=300,
-                                          )
-
-    def fail(msg):
-        status_style = {
-            "display": "block", "background": "rgba(231,76,60,0.1)",
-            "border": "1px solid #e74c3c", "color": "#e74c3c",
-        }
-        return ([empty_fig] * 4 + ["—"] * 6 + [html.Div()] * 3
-                + [f"⚠ {msg}", status_style])
-
-    if not ch_data or not channel or channel not in ch_data:
-        return fail("No data loaded.  Upload a file and select a channel.")
+@app.callback(Output("tau", "value"), Output("auto-status", "children"),
+              Input("auto-button", "n_clicks"), State("recording-token", "data"),
+              State("channels", "value"), State("start", "value"), State("end", "value"),
+              State("low", "value"), State("high", "value"), prevent_initial_call=True)
+def auto_tau(clicks, token, channels, start, end, low, high):
     try:
-        x_full = np.array(ch_data[channel], dtype=np.float64)
-        fs     = float(fs)
+        data, fs = selected_prefix(token, channels, start, end, low, high)
+        tau, _ = ami_delay(data[:, 0], int(.5*fs))
+        return tau/fs*1000, f"τ estimado por AMI: {tau} muestras del primer canal. No garantiza optimalidad."
+    except Exception as error:
+        return no_update, f"Error: {error}"
 
-        t0, t1   = float(epoch[0]), float(epoch[1])
-        i0, i1   = int(t0 * fs), min(int(t1 * fs), len(x_full))
-        x        = x_full[i0:i1]
 
-        # 1. Linear Filtering (Stationarity enforcement)
-        x = sp_signal.detrend(x)
-        x = bandpass(x, fs, 0.5, min(45.0, fs/2.0 - 1))
-        
-        if len(x) < 50:
-            return fail("Epoch too short (< 50 samples). Expand the time window.")
-
-        # 2. Anti-Aliasing & Decimation (Complexity Reduction)
-        f_target = 100.0  
-        q_factor = max(1, int(fs / f_target))
-
-        if q_factor > 1:
-            x_dec = sp_signal.decimate(x, q_factor, ftype='iir', zero_phase=True)
-            fs_new = fs / q_factor
-        else:
-            x_dec = x
-            fs_new = fs
-
-        # 3. Memory Alignment
-        x_dec = np.ascontiguousarray(x_dec, dtype=np.float32)
-        t_dec = np.linspace(t0, t1, len(x_dec))
-
-        # 4. Topological Lag Calculation (on Decimated Signal)
-        max_tau_sec = max_tau_ms / 1000.0
-        tau_dec = compute_optimal_tau(x_dec, fs_new, max_lag_sec=max_tau_sec)
-        tau_dec = max(1, tau_dec)
-
-        # 5. Phase Space Construction
-        # Utilize your existing function but pass the aligned, float32, decimated data
-        dim = min(int(dim), 3)
-        E = phase_space(x_dec, tau_dec, dim=dim) 
-
-        # 6. Feature Extraction (Spectra, Quality, Energy)
-        M      = E.shape[0]
-        energy = spectral_energy_gradient(x_dec, fs_new, M)
-        powers, freqs, psd = compute_band_powers(x_dec, fs_new)
-        quality = signal_quality(x_dec, fs_new)
-
-        # 7. Figures Generation
-        f_ts    = fig_timeseries(t_dec, x_dec, energy, channel, tau_dec)
-        f_3d    = fig_phase_space(E, energy, tau_dec)
-        f_psd   = fig_psd(freqs, psd)
-        f_bands = fig_band_radar(powers)
-
-        # 8. Top metrics (Calculated on decimated for speed, SNR remains invariant)
-        rms = float(np.sqrt(np.mean(x_dec ** 2)))
-        snr = float(10 * np.log10(np.var(x_dec) / (np.var(np.diff(x_dec)) + 1e-12)))
-
-        # ── Insight panels ───────────────────────────────────────────────────
-        def insight_row(label, value):
-            return html.Div([
-                html.Span(label, className="insight-label"),
-                html.Span(value, className="insight-value"),
-            ], className="insight-row")
-
-        quality_panel = html.Div([
-            insight_row(k, v) for k, v in quality.items()
-        ])
-
-        dominant_band = max(powers, key=powers.get)
-        spectral_panel = html.Div([
-            insight_row(k, f"{v:.1f}%") for k, v in powers.items()
-        ] + [
-            html.Div(style={"height": "8px"}),
-            html.Div([
-                html.Span("Dominant Band: ", className="insight-label"),
-                html.Span(dominant_band, style={"color": ACCENT,
-                                                 "fontFamily": "'JetBrains Mono',monospace",
-                                                 "fontSize": "12px",
-                                                 "fontWeight": "600"}),
-            ], className="insight-row"),
-        ])
-
-        hurst_val = float(quality["Hurst Exponent"])
-        kurtosis  = float(quality["Kurtosis"])
-        artifact  = quality["Artifact %"]
-
-        def interpret_hurst(h):
-            if h > 0.6:  return ("Persistent (long-range dependence)", "#06d6a0")
-            if h < 0.4:  return ("Anti-persistent (mean-reverting)", "#f72585")
-            return ("Random walk (near Brownian)", "#fb8500")
-
-        h_text, h_color = interpret_hurst(hurst_val)
-
-        alpha_pct = powers.get("α Alpha", 0)
-        delta_pct = powers.get("δ Delta", 0)
-        theta_pct = powers.get("θ Theta", 0)
-
-        state_hints = []
-        if alpha_pct > 30: state_hints.append("↑ Alpha  →  relaxed / eyes-closed")
-        if delta_pct > 60: state_hints.append("↑ Delta  →  deep sleep / pathology")
-        if theta_pct > 25: state_hints.append("↑ Theta  →  drowsiness / memory encoding")
-        if kurtosis > 10:  state_hints.append("High kurtosis  →  possible spike artifacts")
-        if not state_hints: state_hints = ["Normal waking spectrum pattern"]
-        
-        d2_dim = correlation_dimension(E)
-
-        dynamics_panel = html.Div([
-            insight_row("Correlation Dim (D₂)", f"{d2_dim:.3f}"),
-            insight_row("Hurst Exponent", f"{hurst_val:.3f}"),
-            html.Div([
-                html.Span(h_text, style={"fontFamily": "'JetBrains Mono',monospace",
-                                          "fontSize": "10px", "color": h_color}),
-            ], style={"padding": "4px 0 8px"}),
-            insight_row("Kurtosis", quality["Kurtosis"]),
-            insight_row("Artifact Rate", artifact),
-            html.Div(style={"height": "6px"}),
-            *[html.Div(h, style={
-                "fontFamily": "'JetBrains Mono',monospace",
-                "fontSize": "10px", "color": "#a0aec0",
-                "padding": "3px 0",
-                "borderBottom": f"1px solid {BORDER}",
-              }) for h in state_hints],
-        ])
-
-        status_style = {
-            "display": "block",
-            "background": "rgba(0,212,255,0.06)",
-            "border": f"1px solid {ACCENT}",
-            "color": ACCENT,
-        }
-        status_msg = (
-            f"✓  Analysis complete  ·  {channel}  ·  "
-            f"{len(x_dec)} samples (Decimated {fs:.0f}Hz→{fs_new:.0f}Hz)  ·  "
-            f"τ={tau_dec} smp ({tau_dec/fs_new*1000:.1f}ms)  ·  "
-            f"Manifold shape: {E.shape}"
-        )
-
-        return (
-            f_ts, f_3d, f_psd, f_bands,
-            f"{fs_new:.0f} Hz",
-            f"{(t1-t0):.1f}s",
-            f"{tau_dec} smp",
-            f"{len(x_dec):,}",
-            f"{rms:.2f}",
-            f"{snr:.1f}",
-            quality_panel,
-            spectral_panel,
-            dynamics_panel,
-            status_msg,
-            status_style,
-        )
-
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(tb)
-        return fail(str(e))
-
-# Sync Dimension Slider and Input
-@app.callback(
-    Output("dim-slider", "value"),
-    Output("dim-input", "value"),
-    Input("dim-slider", "value"),
-    Input("dim-input", "value"),
-    prevent_initial_call=True
-)
-def sync_dim(slider_val, input_val):
-    trigger = dash.callback_context.triggered[0]["prop_id"].split(".")[0]
-    val = slider_val if trigger == "dim-slider" else input_val
-    return val, val
-
-# Sync Tau Slider and Input
-@app.callback(
-    Output("tau-slider", "value"),
-    Output("tau-input", "value"),
-    Input("tau-slider", "value"),
-    Input("tau-input", "value"),
-    prevent_initial_call=True
-)
-def sync_tau(slider_val, input_val):
-    trigger = dash.callback_context.triggered[0]["prop_id"].split(".")[0]
-    val = slider_val if trigger == "tau-slider" else input_val
-    return val, val
-
-# Sync Epoch Slider and Inputs
-@app.callback(
-    Output("epoch-slider", "value"),
-    Output("epoch-start-input", "value"),
-    Output("epoch-end-input", "value"),
-    Input("epoch-slider", "value"),
-    Input("epoch-start-input", "value"),
-    Input("epoch-end-input", "value"),
-    State("epoch-slider", "max"),
-    prevent_initial_call=True
-)
-def sync_epoch(slider_val, start_val, end_val, max_val):
-    trigger = dash.callback_context.triggered[0]["prop_id"].split(".")[0]
-    
-    if trigger == "epoch-slider":
-        # Slider was moved, update the inputs
-        return slider_val, slider_val[0], slider_val[1]
-        
-    # An input box was typed into, update the slider and validate constraints
-    start = start_val if start_val is not None else 0
-    end = end_val if end_val is not None else 15
-    
-    # Boundary logic
-    if max_val is None: max_val = 60
-    if start < 0: start = 0
-    if end > max_val: end = max_val
-    if start >= end: start = max(0, end - 0.5)
-    
-    return [start, end], start, end
-
-# UPDATE auto_tune_parameters TO OUTPUT TO ALL 4 CONTROLS
-@app.callback(
-    Output("dim-slider", "value", allow_duplicate=True),
-    Output("dim-input", "value", allow_duplicate=True),
-    Output("tau-slider", "value", allow_duplicate=True),
-    Output("tau-input", "value", allow_duplicate=True),
-    Output("auto-status", "children"),
-    Output("store-optimal", "data"),
-    Input("btn-auto", "n_clicks"),
-    State("store-channels", "data"),
-    State("store-fs", "data"),
-    State("channel-select", "value"),
-    State("epoch-slider", "value"),
-    prevent_initial_call=True,
-)
-def auto_tune_parameters(n_clicks, ch_data, fs, channel, epoch):
-    if not ch_data or not channel or channel not in ch_data:
-        return [dash.no_update]*4 + ["⚠ Load data first", dash.no_update]
+@app.callback(Output("time-figure", "figure"), Output("phase-figure", "figure"),
+              Output("psd-figure", "figure"), Output("dimension-figure", "figure"),
+              Output("diagnostics", "children"), Output("analysis-status", "children"),
+              Input("run-button", "n_clicks"), State("recording-token", "data"),
+              State("channels", "value"), State("start", "value"), State("end", "value"),
+              State("dimension", "value"), State("tau", "value"), State("low", "value"),
+              State("high", "value"), State("theiler", "value"), prevent_initial_call=True)
+def run_analysis(clicks, token, channels, start, end, dimension, tau_ms, low, high, theiler):
     try:
-        x = np.array(ch_data[channel], dtype=np.float64)
-        fs = float(fs)
-        t0, t1 = float(epoch[0]), float(epoch[1])
-        i0, i1 = int(t0 * fs), min(int(t1 * fs), len(x))
-        x_ep = x[i0:i1]
-        x_ep = sp_signal.detrend(x_ep)
-        x_ep = bandpass(x_ep, fs, 0.5, min(45.0, fs/2.0 - 1))
-        
-        f_target = 100.0  
-        q_factor = max(1, int(fs / f_target))
-        fs_new = fs / q_factor if q_factor > 1 else fs
-        x_dec = sp_signal.decimate(x_ep, q_factor, ftype='iir', zero_phase=True) if q_factor > 1 else x_ep
-            
-        tau_smp = compute_optimal_tau(x_dec, fs_new, max_lag_sec=1.0)
-        tau_ms = (tau_smp / fs_new) * 1000.0
-        optimal_tau = min(500, max(10, int(np.ceil(tau_ms / 10.0)) * 10))
-        optimal_dim = compute_optimal_dimension(x_dec, tau_smp, max_m=5)
-        
-        status_msg = f"✓ Tuned: m={optimal_dim}, max_τ={optimal_tau}ms"
-        optimal_cache = {"m": optimal_dim, "tau": optimal_tau}
-        
-        return optimal_dim, optimal_dim, optimal_tau, optimal_tau, status_msg, optimal_cache
-    except Exception as e:
-        return [dash.no_update]*4 + [f"⚠ Error: {str(e)}", dash.no_update]
+        data, fs = selected_prefix(token, channels, start, end, low, high)
+        if dimension is None or int(dimension) != dimension or not 2 <= dimension <= 12:
+            raise ValueError("Dimensión entera entre 2 y 12")
+        cfg = Config(window_s=end-start, step_s=min(10, end-start), dimension=int(dimension),
+                     tau_s=float(tau_ms)/1000, low_hz=float(low), high_hz=float(high), theiler_s=float(theiler))
+        if np.any(data.std(axis=0) < 1e-15):
+            raise ValueError("Canal constante: no se puede estimar geometría")
+        scaled = (data-data.mean(axis=0))/data.std(axis=0)
+        tau = max(1, int(round(cfg.tau_s*fs)))
+        E = delay_embedding(scaled, tau, cfg.dimension)
+        ids = np.unique(np.linspace(0, len(E)-1, min(3000, len(E))).astype(int))
+        centered = E[ids]-E[ids].mean(axis=0)
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        projected = centered @ vt[:3].T
+        projected = np.pad(projected, ((0, 0), (0, max(0, 3-projected.shape[1]))))
+        color = start+(ids+(cfg.dimension-1)*tau)/fs
+        phase = go.Figure(go.Scatter3d(x=projected[:, 0], y=projected[:, 1], z=projected[:, 2], mode="lines",
+                                      line=dict(color=color, colorscale="Viridis", width=3,
+                                                colorbar=dict(title="Tiempo (s)"))))
+        style_figure(phase, f"Proyección PCA 3D de {E.shape[1]} coordenadas")
+        phase.update_layout(scene=dict(xaxis_title="PC1", yaxis_title="PC2", zaxis_title="PC3"))
+        time_fig, psd_fig = go.Figure(), go.Figure()
+        step = max(1, len(data)//5000)
+        for i, ch in enumerate(channels):
+            time_fig.add_trace(go.Scatter(x=start+np.arange(len(data))[::step]/fs,
+                                          y=data[::step, i]*1e6, name=ch, mode="lines"))
+            freq, psd = signal.welch(data[:, i]*1e6, fs=fs, nperseg=min(len(data), int(4*fs)))
+            psd_fig.add_trace(go.Scatter(x=freq, y=10*np.log10(np.maximum(psd, 1e-30)), name=ch))
+        style_figure(time_fig, "Señal filtrada causalmente · µV").update_xaxes(title="Tiempo (s)")
+        style_figure(psd_fig, "PSD · dB respecto a 1 µV²/Hz").update_xaxes(title="Hz", range=[0, min(fs/2, 60)])
+        curve = correlation_curve(E, int(theiler*fs))
+        dim_fig = go.Figure(go.Scatter(x=curve["r"], y=curve["local_slope"], mode="lines+markers"))
+        style_figure(dim_fig, "Pendiente local de correlación · no es un D₂ certificado").update_xaxes(type="log", title="Radio normalizado")
+        fnn = fnn_curve(data[:, 0], tau, max_dimension=min(8, cfg.dimension+2), theiler=int(theiler*fs))
+        metrics = geometry(data, fs, cfg)
+        details = json.dumps({"embedding_shape": list(E.shape), "tau_samples": tau, "tau_ms_actual": tau/fs*1000,
+                              "geometry": metrics, "fnn_first_channel": fnn,
+                              "correlation": curve["note"]}, indent=2)
+        note = "Transitorio inicial: la ventana incluye los primeros 20 s. " if start < 20 else ""
+        return time_fig, phase, psd_fig, dim_fig, details, note+"Análisis exploratorio. La PCA se ajusta solo para esta figura; no compara ejes entre ventanas."
+    except Exception as error:
+        return no_update, no_update, no_update, no_update, no_update, f"Error: {error}"
 
-@app.callback(
-    Output("btn-auto", "style"),
-    Input("dim-slider", "value"),
-    Input("tau-slider", "value"),
-    Input("store-optimal", "data"),
-    prevent_initial_call=True,
-)
-def verify_parameter_state(current_dim, current_tau, optimal_data):
-    """
-    Reactive observer: Checks if manual sliders match the calculated optimal cache.
-    Reconstructs the full style dict to prevent Dash from dropping CSS properties.
-    """
-    # 1. Base CSS that must ALWAYS be applied to the button
-    base_style = {
-        "float": "right", "border": "none", "borderRadius": "4px", 
-        "fontSize": "9px", "fontWeight": "bold", "padding": "2px 6px", 
-        "cursor": "pointer", "fontFamily": "var(--mono)", 
-        "letterSpacing": "0.1em", "transition": "background-color 0.4s ease"
-    }
-    
-    # 2. Check if we have mathematically verified coordinates
-    if optimal_data and optimal_data.get("m") is not None:
-        if current_dim == optimal_data["m"] and current_tau == optimal_data["tau"]:
-            # VERIFIED STATE (Green)
-            base_style["background"] = "#06d6a0" 
-            base_style["color"] = "#0a0c10"
-            return base_style
-            
-    # 3. DEFAULT / UNVERIFIED STATE (Cyan)
-    base_style["background"] = "var(--accent)"
-    base_style["color"] = "var(--bg)"
-    return base_style
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(Output("forecast-data", "data"), Output("forecast-record", "options"),
+              Output("forecast-record", "value"), Output("forecast-status", "children"),
+              Input("forecast-upload", "contents"), prevent_initial_call=True)
+def upload_forecast(contents):
+    try:
+        raw = base64.b64decode(contents.split(",", 1)[1])
+        frame = pd.read_csv(io.BytesIO(raw))
+        if not {"time_s", "probability"} <= set(frame):
+            raise ValueError("Se requieren time_s y probability")
+        if not np.isfinite(frame[["time_s", "probability"]]).all().all() or not frame.probability.between(0, 1).all():
+            raise ValueError("Probabilidades/tiempos inválidos")
+        if "recording" not in frame:
+            frame["recording"] = "registro"
+        names = frame.recording.astype(str).unique().tolist()
+        frame["recording"] = frame.recording.astype(str)
+        synthetic = ("synthetic_model" in frame and
+                     frame.synthetic_model.astype(str).str.lower().isin(["true", "1"]).any())
+        note = " MODELO SINTÉTICO: solo demostración de software." if synthetic else " Comprueba procedencia y modelo en report.json."
+        return frame.to_dict("records"), names, names[0], f"{len(frame)} decisiones."+note
+    except Exception as error:
+        return no_update, no_update, no_update, f"Error: {error}"
+
+
+@app.callback(Output("forecast-figure", "figure"), Input("forecast-record", "value"),
+              State("forecast-data", "data"), prevent_initial_call=True)
+def forecast_figure(record, rows):
+    frame = pd.DataFrame(rows)
+    frame = frame[frame.recording == record].sort_values("time_s")
+    fig = go.Figure(go.Scatter(x=frame.time_s, y=frame.probability, name="Probabilidad"))
+    if "label" in frame:
+        fig.add_trace(go.Scatter(x=frame.time_s, y=frame.label, mode="lines", name="Evento futuro (etiqueta)", line=dict(dash="dot")))
+    if "alert" in frame:
+        selected = frame[frame.alert.astype(str).str.lower().isin(["true", "1"])]
+        fig.add_trace(go.Scatter(x=selected.time_s, y=selected.probability, mode="markers", name="Alertas", marker=dict(size=10, symbol="x")))
+    return style_figure(fig, "Probabilidad de despertar futuro").update_yaxes(range=[-.05, 1.05]).update_xaxes(title="Tiempo (s)")
+
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print(" TAKENS ATTRACTOR DASHBOARD  v2.0")
-    print("=" * 60)
-    print(" Open  →  http://127.0.0.1:8050")
-    print(" Formats: EDF, BDF, CSV, TXT, FIF, SET, NPY")
-    print("=" * 60)
-    # Terminate correctly specifying the server parameters
-    app.run(debug=False, port=8050, dev_tools_silence_routes_logging=True)
+    app.run(debug=False, host="127.0.0.1", port=8050)

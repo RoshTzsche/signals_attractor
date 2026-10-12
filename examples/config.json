@@ -1,0 +1,18 @@
+{
+  "window_s": 60.0,
+  "step_s": 10.0,
+  "lead_s": 30.0,
+  "horizon_s": 120.0,
+  "min_sleep_s": 120.0,
+  "min_wake_s": 60.0,
+  "low_hz": 0.5,
+  "high_hz": 35.0,
+  "filter_order": 4,
+  "warmup_s": 20.0,
+  "tau_s": 0.05,
+  "dimension": 4,
+  "theiler_s": 1.0,
+  "max_points": 256,
+  "recurrence_radius": 0.5,
+  "seed": 42
+}
